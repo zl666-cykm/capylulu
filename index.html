@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23000'/%3E%3Cpath d='M16 16h32v32H16z' fill='none' stroke='%23fff' stroke-width='4'/%3E%3Cpath d='M24 24h16v16H24z' fill='%234cc3d9'/%3E%3C/svg%3E" />
+  <title>AR.js Marker Cube Demo</title>
+  <script src="vendor/three.min.js"></script>
+  <script src="vendor/GLTFLoader.js"></script>
+  <script src="vendor/ar-threex.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, sans-serif;
+    }
+
+    #app {
+      position: fixed;
+      inset: 0;
+      z-index: 2;
+    }
+
+    canvas,
+    video {
+      position: fixed !important;
+      inset: 0;
+      width: 100% !important;
+      height: 100% !important;
+      object-fit: cover;
+    }
+
+    video {
+      z-index: 0 !important;
+    }
+
+    #app canvas {
+      z-index: 2 !important;
+      touch-action: none;
+    }
+
+    .hint,
+    .status {
+      position: fixed;
+      z-index: 10;
+      max-width: min(360px, calc(100vw - 24px));
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    .hint {
+      top: 12px;
+      left: 12px;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .status {
+      top: 12px;
+      right: 12px;
+      color: #d7f7dc;
+      background: rgba(8, 20, 10, 0.75);
+      border: 1px solid rgba(120, 255, 160, 0.25);
+    }
+
+    .status.hidden {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div class="hint">将摄像头对准目标 marker，识别后可拖动旋转模型，双指或滚轮缩放，双击重置。</div>
+  <div class="status" id="status">初始化中...</div>
+
+  <script>
+    (function () {
+      var statusNode = document.getElementById('status');
+      var statusLines = [];
+      var debugMode = /[?&]debug=1\b/.test(window.location.search);
+
+      if (!debugMode) {
+        statusNode.classList.add('hidden');
+      }
+
+      function setStatus(message) {
+        statusLines.push(message);
+        statusNode.textContent = statusLines.slice(-12).join('\n');
+      }
+
+      function reportError(prefix, error) {
+        var text = error && error.message ? error.message : String(error);
+        setStatus(prefix + ': ' + text);
+      }
+
+      window.addEventListener('error', function (event) {
+        reportError('Window error', event.message || event.error);
+      });
+
+      window.addEventListener('unhandledrejection', function (event) {
+        reportError('Promise error', event.reason);
+      });
+
+      setStatus('URL: ' + window.location.href);
+      setStatus('SecureContext: ' + window.isSecureContext);
+      setStatus('THREE loaded: ' + Boolean(window.THREE));
+      setStatus('THREEx loaded: ' + Boolean(window.THREEx));
+      setStatus('GLTFLoader loaded: ' + Boolean(THREE.GLTFLoader));
+
+      if (window.location.protocol === 'file:') {
+        setStatus('错误: 当前是 file:// 打开');
+        setStatus('请改用 http://localhost 访问 index.html');
+        return;
+      }
+
+      if (!window.THREE || !window.THREEx) {
+        setStatus('依赖加载失败');
+        return;
+      }
+
+      var container = document.getElementById('app');
+      var activePointers = new Map();
+      var isDragging = false;
+      var lastPointerX = 0;
+      var lastPointerY = 0;
+      var lastPinchDistance = 0;
+      var currentScale = 1;
+      var minScale = 0.3;
+      var maxScale = 3;
+      var currentYaw = 0;
+      var currentPitch = 0;
+      var minPitch = -Math.PI / 3;
+      var maxPitch = Math.PI / 3;
+      var scene = new THREE.Scene();
+      var camera = new THREE.Camera();
+      scene.add(camera);
+
+      function clamp(value, min, max) {
+        return Math.min(Math.max(value, min), max);
+      }
+
+      function applyModelTransform() {
+        modelPivot.rotation.y = currentYaw;
+        modelPivot.rotation.x = currentPitch;
+        modelPivot.scale.setScalar(currentScale);
+      }
+
+      function resetModelTransform() {
+        currentYaw = 0;
+        currentPitch = 0;
+        currentScale = 1;
+        applyModelTransform();
+        setStatus('Model transform reset');
+      }
+
+      function getPointerDistance() {
+        var points = Array.from(activePointers.values());
+        if (points.length < 2) {
+          return 0;
+        }
+
+        var dx = points[0].x - points[1].x;
+        var dy = points[0].y - points[1].y;
+        return Math.sqrt(dx * dx + dy * dy);
+      }
+
+      var renderer = new THREE.WebGLRenderer({
+        antialias: true,
+        alpha: true
+      });
+      renderer.setClearColor(new THREE.Color('lightgrey'), 0);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.domElement.style.position = 'fixed';
+      renderer.domElement.style.top = '0';
+      renderer.domElement.style.left = '0';
+      renderer.domElement.style.zIndex = '1';
+      container.appendChild(renderer.domElement);
+      setStatus('Renderer ready');
+
+      var light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1.2);
+      scene.add(light);
+
+      var arSource = new THREEx.ArToolkitSource({
+        sourceType: 'webcam',
+        sourceWidth: 640,
+        sourceHeight: 480,
+        displayWidth: window.innerWidth,
+        displayHeight: window.innerHeight
+      });
+
+      function watchVideo(video) {
+        if (!video) {
+          setStatus('No video element found');
+          return;
+        }
+
+        video.setAttribute('autoplay', '');
+        video.setAttribute('muted', '');
+        video.setAttribute('playsinline', '');
+        video.muted = true;
+        video.playsInline = true;
+        video.style.zIndex = '0';
+        video.style.background = '#111';
+
+        function reportVideoState(label) {
+          setStatus(label + ': ' + video.videoWidth + 'x' + video.videoHeight + ', readyState=' + video.readyState + ', paused=' + video.paused);
+        }
+
+        video.addEventListener('loadedmetadata', function () {
+          reportVideoState('Video metadata');
+        });
+
+        video.addEventListener('canplay', function () {
+          reportVideoState('Video canplay');
+        });
+
+        video.addEventListener('playing', function () {
+          reportVideoState('Video playing');
+        });
+
+        var playPromise = video.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          playPromise.then(function () {
+            reportVideoState('Video play requested');
+          }).catch(function (error) {
+            reportError('Video play failed', error);
+          });
+        }
+
+        var checks = 0;
+        var videoTimer = window.setInterval(function () {
+          checks += 1;
+          reportVideoState('Video poll');
+
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            onResize();
+            window.clearInterval(videoTimer);
+            return;
+          }
+
+          if (checks >= 10) {
+            setStatus('Video remains 0x0; stream not rendering');
+            window.clearInterval(videoTimer);
+          }
+        }, 1000);
+      }
+
+      function onResize() {
+        arSource.onResizeElement();
+        arSource.copyElementSizeTo(renderer.domElement);
+
+        if (arContext.arController !== null) {
+          arSource.copyElementSizeTo(arContext.arController.canvas);
+        }
+      }
+
+      arSource.init(function onReady() {
+        setStatus('Camera source ready');
+        onResize();
+
+        var video = document.querySelector('video');
+        if (video) {
+          setStatus('Video detected');
+          watchVideo(video);
+        }
+      }, function onError(error) {
+        reportError('Camera source failed', error);
+      });
+
+      window.addEventListener('resize', onResize);
+
+      var arContext = new THREEx.ArToolkitContext({
+        cameraParametersUrl: 'vendor/camera_para.dat',
+        detectionMode: 'mono'
+      });
+
+      arContext.init(function onCompleted() {
+        camera.projectionMatrix.copy(arContext.getProjectionMatrix());
+        setStatus('AR context ready');
+      });
+
+      var markerRoot = new THREE.Group();
+      scene.add(markerRoot);
+
+      new THREEx.ArMarkerControls(arContext, markerRoot, {
+        type: 'pattern',
+        patternUrl: 'src/capylulu.patt'
+      });
+      setStatus('Marker controls ready');
+
+      var modelRoot = new THREE.Group();
+      modelRoot.position.y = 0.02;
+      markerRoot.add(modelRoot);
+
+      var modelPivot = new THREE.Group();
+      modelRoot.add(modelPivot);
+      applyModelTransform();
+
+      var boxGeometry = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+      var boxMaterial = new THREE.MeshBasicMaterial({ color: 0xff2d55 });
+      var fallbackCube = new THREE.Mesh(boxGeometry, boxMaterial);
+      fallbackCube.position.y = 0.25;
+      fallbackCube.visible = false;
+      modelPivot.add(fallbackCube);
+
+      var gltfLoader = new THREE.GLTFLoader();
+      gltfLoader.load(
+        'src/model.glb',
+        function onLoad(gltf) {
+          var model = gltf.scene;
+          var bounds = new THREE.Box3().setFromObject(model);
+          var size = bounds.getSize(new THREE.Vector3());
+          var center = bounds.getCenter(new THREE.Vector3());
+          var maxAxis = Math.max(size.x, size.y, size.z) || 1;
+          var scale = 0.6 / maxAxis;
+
+          model.position.sub(center);
+          model.position.y += size.y * scale * 0.5;
+          model.scale.setScalar(scale);
+          modelPivot.add(model);
+          setStatus('GLB model loaded');
+        },
+        function onProgress(event) {
+          if (event.total > 0) {
+            var percent = Math.round(event.loaded / event.total * 100);
+            setStatus('GLB loading: ' + percent + '%');
+          }
+        },
+        function onError(error) {
+          fallbackCube.visible = true;
+          reportError('GLB load failed', error);
+        }
+      );
+
+      var planeGeometry = new THREE.PlaneGeometry(1.6, 1.6, 1, 1);
+      var planeMaterial = new THREE.MeshBasicMaterial({
+        color: 0x00ff88,
+        transparent: true,
+        opacity: 0.45,
+        side: THREE.DoubleSide
+      });
+      var plane = new THREE.Mesh(planeGeometry, planeMaterial);
+      plane.rotation.x = -Math.PI / 2;
+      markerRoot.add(plane);
+
+      var axesHelper = new THREE.AxesHelper(1);
+      markerRoot.add(axesHelper);
+
+      renderer.domElement.addEventListener('dblclick', function () {
+        resetModelTransform();
+      });
+
+      renderer.domElement.addEventListener('pointerdown', function (event) {
+        if (!markerVisible) {
+          return;
+        }
+
+        renderer.domElement.setPointerCapture(event.pointerId);
+        activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+        if (activePointers.size === 1) {
+          isDragging = true;
+          lastPointerX = event.clientX;
+          lastPointerY = event.clientY;
+        } else if (activePointers.size === 2) {
+          isDragging = false;
+          lastPinchDistance = getPointerDistance();
+        }
+      });
+
+      renderer.domElement.addEventListener('pointerup', function (event) {
+        activePointers.delete(event.pointerId);
+        isDragging = activePointers.size === 1;
+
+        if (isDragging) {
+          var remainingPoint = Array.from(activePointers.values())[0];
+          lastPointerX = remainingPoint.x;
+          lastPointerY = remainingPoint.y;
+        } else {
+          lastPinchDistance = 0;
+        }
+      });
+
+      renderer.domElement.addEventListener('pointercancel', function (event) {
+        activePointers.delete(event.pointerId);
+        isDragging = false;
+        lastPinchDistance = 0;
+      });
+
+      renderer.domElement.addEventListener('pointermove', function (event) {
+        if (!markerVisible || !activePointers.has(event.pointerId)) {
+          return;
+        }
+
+        activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+        if (activePointers.size === 1 && isDragging) {
+          var deltaX = event.clientX - lastPointerX;
+          var deltaY = event.clientY - lastPointerY;
+          lastPointerX = event.clientX;
+          lastPointerY = event.clientY;
+          currentYaw += deltaX * 0.01;
+          currentPitch = clamp(currentPitch + deltaY * 0.01, minPitch, maxPitch);
+          applyModelTransform();
+          return;
+        }
+
+        if (activePointers.size === 2) {
+          var pinchDistance = getPointerDistance();
+          if (lastPinchDistance > 0 && pinchDistance > 0) {
+            currentScale = clamp(currentScale * (pinchDistance / lastPinchDistance), minScale, maxScale);
+            applyModelTransform();
+          }
+          lastPinchDistance = pinchDistance;
+        }
+      });
+
+      renderer.domElement.addEventListener('wheel', function (event) {
+        if (!markerVisible) {
+          return;
+        }
+
+        event.preventDefault();
+        currentScale = clamp(currentScale * (event.deltaY < 0 ? 1.1 : 0.9), minScale, maxScale);
+        applyModelTransform();
+      }, { passive: false });
+
+      var wasVisible = false;
+      var markerStableFrames = 0;
+      var markerLostFrames = 0;
+      var markerVisible = false;
+
+      function animate() {
+        requestAnimationFrame(animate);
+
+        if (arSource.ready) {
+          arContext.update(arSource.domElement);
+        }
+
+        if (markerRoot.visible) {
+          markerStableFrames += 1;
+          markerLostFrames = 0;
+          if (!markerVisible && markerStableFrames >= 8) {
+            markerVisible = true;
+            setStatus('Marker stabilized');
+          }
+        } else {
+          markerLostFrames += 1;
+          markerStableFrames = 0;
+          if (markerVisible && markerLostFrames >= 8) {
+            markerVisible = false;
+            setStatus('Marker lost');
+          }
+        }
+
+        modelRoot.visible = markerVisible;
+        plane.visible = markerVisible;
+        axesHelper.visible = markerVisible;
+        renderer.render(scene, camera);
+
+        if (markerRoot.visible !== wasVisible) {
+          wasVisible = markerRoot.visible;
+          setStatus(markerRoot.visible ? 'Marker detected' : 'Marker detection dropped');
+        }
+      }
+
+      animate();
+      setStatus('Render loop started');
+    })();
+  </script>
+</body>
+</html>
